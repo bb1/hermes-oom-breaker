@@ -1,0 +1,3 @@
+name: hermes-oom-breaker
+version: 0.0.1
+description: "OOM protection for brain LLM traffic: exact fit-gate (llm_execution middleware), reactive compaction breaker, on-the-fly learned limit"

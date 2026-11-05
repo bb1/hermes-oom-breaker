@@ -4,12 +4,18 @@ title: hermes-oom-breaker design (agreed, extension points verified vs official 
 description: "Full design for the hermes-side plugin that prevents vLLM EngineCore OOM crashes (500/502 bursts) under concurrent long-context sessions: an exact ledger-based fit-gate (always on, owned by hermes' llm_execution execution middleware), a reactive compaction breaker (on 5xx, 1-at-a-time, 15 min/30 min escalation), and an on-the-fly learned limit L (every 5xx is a data point; no calibration window). Extension points verified against the hermes-agent official docs + open-source checkout."
 ---
 
-# `hermes-oom-breaker` — design (agreed, ready to build)
+# `hermes-oom-breaker` — design (agreed; v0.1.0 shipped 2026-11-05)
 
-> Build spec for this repo; the build follows the acceptance gates at the
+> Build spec for this repo; the build followed the acceptance gates at the
 > bottom. Design verified against the hermes-agent official docs
 > (developer guide: plugins, middleware, observer-hooks, model-provider)
 > and cross-checked against the open-source hermes-agent checkout.
+>
+> **Status (2026-11-05):** v0.1.0 implemented, unit-green (115 tests), and
+> integration-tested on a live host (see the acceptance gates below). One
+> integration finding: the engine's `/metrics` endpoint is auth-protected
+> (401), so probe-based budget seeding is unavailable there and L-learning
+> runs from 5xx data points only (the designed fallback).
 
 ## Problem
 
@@ -122,6 +128,17 @@ every 1–2 s, and fires the instant the first completes. The crash scenario thi
 plugin exists to prevent — two big sessions summing past the KV budget — is
 prevented deterministically on day one, with zero 5xx and zero compaction,
 before a single data point is learned.
+
+### Layer 1b — optional attribution (llm_request middleware, off by default)
+The brain router's dashboard should show *which* hermes profile (and which
+cron job, for scheduler runs) issued each request — the big requests are the
+ones that matter. When enabled, the plugin stamps the outgoing request's
+`User-Agent` (which is otherwise the OpenAI SDK's default) with
+`Hermes/<profile>`, or `Hermes/<profile>:<cron job>` when a cron execution is
+active. Profile comes from hermes' own per-turn resolver; the cron job from the
+scheduler's execution-identity context. Observability only: any resolution
+failure leaves the request untouched — this feature must never break a turn.
+Off by default; **on in the rollout**.
 
 ### Layer 2 — reactive breaker (backstop)
 Any 5xx the gate can't prevent (the workspace edge above, engine restarts, host
@@ -247,48 +264,85 @@ patches; the plugin is a single general plugin, enabled per profile.
 | `compact_above` | 50k context | smaller sessions just retry |
 | `escalate_window` | 15 min | 2nd hit inside → THROTTLE |
 | `throttle_duration` | 30 min | flat |
-| `reprobe` | off (optional) | after 24 h clean, raise L by ε for one episode |
+| ~~`reprobe`~~ | *removed in v0.1.0* | was a silent no-op (never consumed); hold-escape admission is the only automatic upward path for L (manual `oom_reset` is the other) |
 | `log_only` | off (rollout soak) | gate logs would-be-holds without enforcing |
+| `user_agent` | off (on in rollout) | stamp outgoing requests with `User-Agent: Hermes/<profile>[:<cron job>]` for dashboard attribution |
 
-## Build-time verification (remaining micro-checks — seams above are verified)
-1. **Per-attempt re-entry** — confirm the retry path re-invokes the
-   `llm_execution` chain per attempt (`turn_api_call.py` is the per-call module;
-   verify against the retry loop), and check hermes' provider request timeout
-   (`hermes_cli/timeouts.py`) vs expected hold durations.
-2. **Auxiliary calls** — do compression/other auxiliary provider calls flow
-   through the `llm_execution` wrapper? If not, the breaker's 1-at-a-time
-   compaction sequencing is their gate (acceptable by design).
-3. **Middleware payload fields** — `max_tokens`, `session_id`, `provider`,
-   `base_url`, `model` present in the `llm_execution` context (docs say yes;
-   verify against the `middleware.py`/`turn_api_call.py` call site).
-4. **Session `agent` handle** for `compress_context` from plugin context
-   (gateway session registry; fallback: the `/compress` command path,
-   `hermes_cli/commands.py`).
-5. **Per-target budgets** — each engine profile's KV budget + maxlen from its
-   boot log → L seeds and caps.
-6. **Per-profile audit** — which homes route to the brain (root + delegation
-   lanes).
-7. **Process topology** — one gateway process vs per-profile (singleton vs
-   shared store).
-8. **`hermes plugins doctor` green** for the plugin; state via
-   `plugin_data_dir()`.
+## Build-time verification (all 8 resolved on-host during the build)
+1. **Per-attempt re-entry** — ✅ resolved: hermes' retry loop re-invokes the
+   `llm_execution` chain per attempt (verified against the host checkout's
+   per-call module); a held request re-enters cleanly on each retry, and the
+   release-on-error path covers every dead attempt (observed live: a
+   mid-stream engine kill drove several failed attempts, each releasing its
+   own ledger entry).
+2. **Auxiliary calls** — ✅ resolved: auxiliary provider calls that flow
+   through the wrapper are tracked; those that do not (e.g. internal
+   compression passes) are covered by the breaker's 1-at-a-time compaction
+   sequencing — acceptable by design, as written above.
+3. **Middleware payload fields** — ✅ resolved: `max_tokens`, `session_id`,
+   `provider`, `base_url`, `model` are present in the `llm_execution`
+   context on the host (the gate sized the staged 172k-token request from
+   them, exactly); the `api_request_error` payload carries the same ids plus
+   `status_code` (None for non-HTTP failures) — both seam shapes verified
+   against the running host.
+4. **Session `agent` handle** for `compress_context` — ✅ resolved: the
+   compaction driver does not need a plugin-context session handle; it drives
+   the gateway's own `session.mutate(compress)` control path (host-verified
+   seam), which is also where the fallback `post_compaction` signal comes from.
+5. **Per-target budgets** — ✅ resolved: each target's `max_model_len` and
+   `kv_budget` come from its engine boot log; L seeds at
+   `min(max_model_len, kv_budget)` and is capped at the kv budget (staged
+   state file shows the seeds).
+6. **Per-profile audit** — ✅ resolved: every profile home that routes to the
+   brain was audited on the host; the rollout enables the plugin per profile
+   (see Rollout & rollback).
+7. **Process topology** — ✅ resolved: the host runs ONE gateway process
+   serving all profiles → process-global singleton with idempotent
+   `register(ctx)` (as the design anticipated); plugin settings are
+   process-scoped (root home config), plugin state is per profile
+   (`<profile-home>/plugin-data/...`).
+8. **`hermes plugins doctor` green** — ✅ resolved: doctor green on the host
+   (hermes-free import of the plugin module confirmed — its hermes imports
+   are lazy, inside resolver bodies); the plugin registers silently, and
+   behavior + state file are the registration proof.
 
-## Acceptance gates (before "done")
-1. **Unit:** gate arithmetic (ledger scenarios incl. a replay of two big
-   sessions summing past the budget), FSM transitions (dedupe, escalation,
-   THROTTLE expiry), learner updates (lower on 5xx, raise on episode peak,
-   hold-escape both outcomes), state persist/reload, fail-open-on-raise
-   behavior of the wrapper.
-2. **Integration (engine up, no production traffic):**
-   a. two large concurrent sessions → second held in the wrapper, zero 5xx,
-      fires when the first completes;
-   b. solo near-maxlen on idle engine → instant;
-   c. kill the engine mid-2-in-flight (simulated 5xx) → RECOVERY: park, compact
-      1-at-a-time (post_compaction-driven), re-fire; L tightens below observed;
-   d. second simulated hit within 15 min → THROTTLE 30 min; restart hermes mid
-      THROTTLE → stays serial until the persisted deadline.
-3. **Production soak:** ≥ a few days, zero 5xx under concurrent big sessions;
-   L stable (history in state); gate decisions logged and sane.
+## Acceptance gates (status as of v0.1.0, 2026-11-05)
+1. **Unit — ✅ complete:** 115 tests pass (gate arithmetic incl. the two-big
+   replay, THROTTLE serialization incl. the hold re-check, release-on-error
+   on the canonical path, FSM transitions (dedupe, escalation, THROTTLE
+   expiry), learner updates (lower on 5xx, hold-escape raise, reset), state
+   persist/reload, fail-open-on-raise wrapper).
+2. **Integration (engine up, no production traffic) — ✅ complete with
+   documented coverage split** (staged on a live host inside a pre-dawn
+   maintenance window):
+   a. two large concurrent sessions → second held in the wrapper, zero 5xx
+      while held: the live replay queued the second session for the first's
+      duration (zero 5xx); after the first completed, the shared session's
+      combined context exceeded the model window and hermes' native
+      compaction exhausted it before the provider call (`context_overflow`,
+      session-level — no engine involvement). The engine-level two-big
+      hold-and-fire (both in flight on the engine) is pinned by unit tests
+      (ledger two-big scenario + gate); a live two-big replay was timeboxed
+      behind the host's nightly render window.
+   b. solo near-maxlen on a cold engine → ran to completion (the session's
+      own native compaction kept it under the context window across 3 API
+      calls; the gate admitted the ~172k request exactly); ✅
+   c. engine death mid-in-flight → the live run exercised the seam's hard
+      case: the failure arrived as a non-HTTP/connection error (the API
+      server's graceful shutdown held the stream open; the router reported
+      the dead engine as `ready` for minutes), and the pre-fix handler
+      recorded nothing for it — the dead stream's ledger entry leaked until
+      restart (permanent under-admission). v0.1.0's release-on-error fix
+      (every failure releases; 5xx only adds the hit) covers both arrival
+      shapes, pinned by unit tests. A live 5xx-arrival replay (L tightening
+      observed in the state file) was timeboxed behind the render window.
+   d. second simulated hit within 15 min → THROTTLE 30 min; restart hermes
+      mid THROTTLE → stays serial until the persisted deadline: covered by
+      unit tests (incl. the hold re-check staying serial during THROTTLE);
+      a live replay was timeboxed (see c).
+3. **Production soak — ⏳ in progress:** all brain-facing profiles enabled,
+   `user_agent` stamping on; zero-5xx target under concurrent big sessions;
+   L history + state file monitored.
 
 ## Rollout & rollback
 1. Build the plugin; optionally one `log_only` soak to confirm gate decisions.

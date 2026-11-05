@@ -236,13 +236,22 @@ patches; the plugin is a single general plugin, enabled per profile.
   **per profile home**. A profile left without it bypasses the gate and the
   ledger → undercount → the original OOM. (Which homes actually route to the
   brain, incl. delegation lanes: per-profile audit at build time.)
-- **Process topology check (build-time):** if the gateway is one process serving
-  all profiles (expected), the ledger/L/breaker state is a process-global
-  module-level singleton with idempotent `register(ctx)` (the established
-  long-lived-hermes-plugin pattern — cross-thread SQLite
-  `check_same_thread=False` + `RLock`). If hermes runs one process per profile,
-  the gate stays the middleware but the ledger moves to the shared durable store
-  (`plugin_data_dir()` + file locking / atomic CAS).
+- **Process topology check (build-time) — ✅ resolved on-host, 2026-11-05 (corrected):**
+   the host runs ONE gateway process serving all profiles, but hermes imports
+   the plugin module **per profile scope** (per-scope package instance
+   `hermes_plugins.<slug>__home_<hash>`). So the module-level singleton is per
+   SCOPE, not per process: each scope gets its own controller, ledger, learned
+   L, breaker, and settings view (its own home config — no root→profile
+   inheritance). Consequences (all v0.1.0-relevant, host-verified):
+   (a) admission and L-learning are per scope — concurrent big calls within
+   one scope are jointly gated (the incident pattern); concurrent big calls
+   across different scopes are each gated only against their own scope's
+   load (shared cross-scope ledger = follow-up);
+   (b) every brain-facing scope needs its OWN `plugins.entries` settings
+   block (a scope enabled without settings logs a loud `unconfigured`
+   warning and passes through — caught live during the 2026-11-05 rollout);
+   (c) plugin state is per scope under `<scope-home>/plugin-data/...` (the
+   per-profile state dirs observed).
 - Hot-reload caveat: control-socket `reload-plugins` re-registers handlers but
   does **not** re-import the plugin module → a full gateway restart is required
   after plugin code changes.
@@ -296,11 +305,14 @@ patches; the plugin is a single general plugin, enabled per profile.
 6. **Per-profile audit** — ✅ resolved: every profile home that routes to the
    brain was audited on the host; the rollout enables the plugin per profile
    (see Rollout & rollback).
-7. **Process topology** — ✅ resolved: the host runs ONE gateway process
-   serving all profiles → process-global singleton with idempotent
-   `register(ctx)` (as the design anticipated); plugin settings are
-   process-scoped (root home config), plugin state is per profile
-   (`<profile-home>/plugin-data/...`).
+7. **Process topology** — ✅ resolved on-host (corrected 2026-11-05): the
+    host runs ONE gateway process serving all profiles, but the plugin module
+    is imported per profile scope → per-scope controller/ledger/L/settings
+    (see the topology check above); settings are per-scope (each brain-facing
+    home config carries its own `plugins.entries` block — no root→profile
+    inheritance), plugin state is per scope (`<scope-home>/plugin-data/...`).
+    Cross-scope concurrent big calls are not jointly gated (v0.1.0
+    documented limitation; shared ledger = follow-up).
 8. **`hermes plugins doctor` green** — ✅ resolved: doctor green on the host
    (hermes-free import of the plugin module confirmed — its hermes imports
    are lazy, inside resolver bodies); the plugin registers silently, and

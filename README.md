@@ -33,6 +33,14 @@ a live host inside a pre-dawn maintenance window:
 
 Known limitations (v0.1.0):
 
+- admission is **per scope**: the host-verified topology is one gateway
+  process with the plugin module imported per profile scope, so each scope
+  runs its own controller, ledger, and learned L. Concurrent big calls
+  *within* one scope are jointly gated (the incident pattern: one profile's
+  main session + its subagents); concurrent big calls *across different
+  scopes* are each gated only against their own scope's load — a shared
+  cross-scope ledger is a follow-up. A 5xx tightens the L of the scope that
+  saw the hit;
 - the engine's `/metrics` endpoint is auth-protected (401) on the target
   host, so probe-based budget reads are unavailable there and L-learning runs
   from 5xx data points only — the designed fallback;
@@ -79,17 +87,32 @@ keeps full concurrency, including during the breaker's throttle.
 
 ## Install
 
+Plugin **code is also per scope**: each scope loads the plugin from its own
+home's `plugins/` directory. Clone (or copy) the runtime files — the top-level
+`*.py` + `plugin.yaml` — into `~/.hermes/plugins/hermes-oom-breaker/` (root
+scope) and into `~/.hermes/profiles/<profile>/plugins/hermes-oom-breaker/`
+for each brain-facing profile:
+
 ```sh
-git clone https://github.com/bb1/hermes-oom-breaker ~/.hermes/plugins/hermes-oom-breaker
+git clone https://github.com/bb1/hermes-oom-breaker
+cp hermes-oom-breaker/{*.py,plugin.yaml} ~/.hermes/plugins/hermes-oom-breaker/
+# and likewise into each profile's plugins/ dir
 ```
 
-**Plugin settings are process-scoped**: the `plugins.entries` settings block
-belongs in the gateway process's root home config. Each profile that may talk
-to the brain enables the plugin in its own profile config. Plugin state is
-stored per profile under `<profile-home>/plugin-data/`. A full gateway
-restart is required (plugin handlers are not hot-reloaded).
+**Plugin settings are resolved per scope** (host-verified: one gateway
+process, but the plugin module is imported per profile scope — each scope
+reads its *own* home config, with no inheritance from the root config).
+Every scope that may talk to the brain therefore needs **both**, in its own
+home config: the `plugins.entries.hermes-oom-breaker` settings block **and**
+`hermes-oom-breaker` in its `plugins.enabled` list. Plugin state is stored
+per scope under `<scope-home>/plugin-data/`. A full gateway restart is
+required (plugin handlers are not hot-reloaded). An enabled scope whose
+config lacks settings degrades to a zero-behavior pass-through and logs a
+loud `unconfigured` warning at registration — grep the gateway log for it
+after a rollout.
 
-Root home config (`~/.hermes/config.yaml`):
+Each brain-facing home config (the root home `~/.hermes/config.yaml` for the
+root scope; each profile home `~/.hermes/profiles/<profile>/config.yaml`):
 
 ```yaml
 plugins:
@@ -108,10 +131,16 @@ plugins:
             metrics_url: http://<engine-host>:<port>/metrics
 ```
 
-Each brain-facing profile config (`~/.hermes/profiles/<profile>/config.yaml`):
+Each brain-facing profile config (`~/.hermes/profiles/<profile>/config.yaml`)
+carries the **same** `plugins.entries.hermes-oom-breaker` settings block (the
+settings are not inherited from the root config) plus the enablement:
 
 ```yaml
 plugins:
+  entries:
+    hermes-oom-breaker:
+      settings:
+        # identical block to the one above
   enabled:
     - hermes-oom-breaker
 ```

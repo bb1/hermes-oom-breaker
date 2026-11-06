@@ -8,7 +8,7 @@ Hermes-free (clock injected).
 from __future__ import annotations
 
 import threading
-from typing import Callable, List, Optional
+from typing import Callable, List, Optional, Tuple
 
 
 class Breaker:
@@ -57,19 +57,21 @@ class Breaker:
 
     # -- events -----------------------------------------------------------
     def hit(self, target: str, in_flight: int, session_ids: List[str],
-            status_code: int, now: float) -> str:
-        """Register a hit. Returns the resulting state.
+            status_code: int, now: float) -> Tuple[str, bool]:
+        """Register a hit. Returns ``(state, deduped)`` — the resulting state
+        and whether this hit was deduped as a burst duplicate.
 
         Burst dedupe: 5xx inside ``hit_dedupe`` of the previous hit = the same
-        hit. Escalation: a *new* hit inside ``escalate_window`` of the previous
-        hit -> THROTTLE (checked against the previous hit, before this one
-        updates the learner's timestamp).
+        hit -> ``(current state, True)``, nothing is updated. Escalation: a
+        *new* hit inside ``escalate_window`` of the previous hit -> THROTTLE
+        (``"throttle", False``; checked against the previous hit, before this
+        one updates the learner's timestamp). Otherwise -> ``"recovery"``.
         """
         with self._lock:
             b = self._blob()
             last = b.get("last_hit")
             if last is not None and now - last < self._cfg.hit_dedupe:
-                return b.get("state", "normal")
+                return b.get("state", "normal"), True
 
             prior_hit = self._learner.last_hit_ts()
             escalate = (
@@ -91,7 +93,7 @@ class Breaker:
                 b.update({"state": "recovery", "queue": queue, "active": None})
             b["last_hit"] = now
             self._write(b)
-            return b["state"]
+            return b["state"], False
 
     # -- compaction sequencing ---------------------------------------------
     def start_compaction(self, session_id: str) -> bool:

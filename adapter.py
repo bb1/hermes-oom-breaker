@@ -13,8 +13,9 @@ green in a hermes-free environment).
 from __future__ import annotations
 
 import logging
+import threading
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional, Tuple
 from urllib.request import urlopen
 
 from .breaker import Breaker
@@ -22,6 +23,7 @@ from .config import Config, Target
 from .ledger import Ledger, target_of
 from .learner import Learner
 from .metrics import MetricsProbe
+from .notify import Notifier
 
 if TYPE_CHECKING:
     from .compaction_driver import CompactionDriver
@@ -127,11 +129,15 @@ class GateController:
 
     def __init__(self, cfg: Config, store,
                  now: Callable[[], float] = time.time,
-                 sleep: Callable[[float], None] = time.sleep):
+                 sleep: Callable[[float], None] = time.sleep,
+                 notifier: Optional[Notifier] = None):
         self.cfg = cfg
         self.store = store
         self.now = now
         self.sleep = sleep
+        # Debug posts (off unless cfg.debug): injected in tests; the
+        # production notifier reads the scope's home .env on each post.
+        self._notifier = notifier if notifier is not None else Notifier(cfg, now=now)
         self.ledger = Ledger(now, hold_escape=cfg.hold_escape)
         self.learner = Learner(now, store, race_reserve=cfg.race_reserve,
                                escalate_window=cfg.escalate_window)
@@ -143,6 +149,11 @@ class GateController:
         self.compaction_driver = None              # Task 7 installs the driver
         self.api_error_hook_registered = False     # Task 7's hook is canonical
         self.last_driver_status: Optional[str] = None  # Task 7's oom_status
+        # Debug-post meta for driver-thread completions: (stashed home,
+        # attribution label) per dispatched session — the driver's worker
+        # thread has no per-turn context, so both are captured at dispatch.
+        self._dispatch_meta: Dict[str, Tuple[Optional[str], str]] = {}
+        self._meta_lock = threading.Lock()
         # Aliased so target resolution works before load_targets() runs.
         self.targets: Dict[str, Target] = cfg.targets
 
@@ -198,6 +209,39 @@ class GateController:
         if job:
             label += f":{job}"
         return label
+
+    # -- debug posts (opt-in one-line notices) -------------------------------
+    def _attribution(self) -> str:
+        """The debug-post label: "" (no profile resolved), "<profile>", or
+        "<profile>:<job>" for a cron execution. Reuses the UA resolvers but
+        is stricter than ``build_user_agent``: a job without a profile yields
+        no label (not ``":job"``), and resolver failures are swallowed here
+        (the post proceeds unlabeled rather than lost)."""
+        try:
+            profile = self.profile_fn()
+        except Exception:
+            profile = None
+        try:
+            job = self.cron_fn()
+        except Exception:
+            job = None
+        if not profile:
+            return ""
+        label = str(profile)
+        if job:
+            label += f":{job}"
+        return label
+
+    def _debug_post(self, event: str, line: str, *,
+                    home: Optional[str] = None,
+                    label: Optional[str] = None) -> None:
+        """One opt-in debug notice: "[oom-breaker] (label) line", the
+        parenthetical omitted when the label is empty. The notifier never
+        raises (off unless cfg.debug; rate-limited per event type), so this
+        is called directly — no extra wrapper."""
+        text = (f"[oom-breaker] ({label}) {line}" if label
+                else f"[oom-breaker] {line}")
+        self._notifier.post(event, text, home=home)
 
     # -- llm_execution middleware -------------------------------------------
     def llm_execution(self, request: dict, next_call, **context: Any) -> Any:
@@ -293,6 +337,11 @@ class GateController:
                     "oom-breaker: request %r held %.0fs on target %s past "
                     "max_hold; admitting anyway (reason=%s)",
                     request_id, now - held_at, target, why)
+                self._debug_post(
+                    "delayed",
+                    f"request held {now - held_at:.0f}s on '{target}' "
+                    "(max_hold); admitted anyway",
+                    home=_current_home(), label=self._attribution())
                 return
             admitted, reason = self.ledger.held(
                 request_id, session_id, target, needed, limit,
@@ -311,6 +360,13 @@ class GateController:
                             "oom-breaker: hold-escape learner update failed "
                             "for %r (target %s)", request_id, target,
                             exc_info=True)
+                    line = (f"request held {now - held_at:.0f}s on "
+                            f"'{target}' (hold_escape); admitted"
+                            if held_at is not None
+                            else f"request admitted on '{target}' "
+                                 "(hold_escape)")
+                    self._debug_post("delayed", line, home=_current_home(),
+                                     label=self._attribution())
                 return
             self.sleep(self.cfg.recheck_cadence)
 
@@ -363,8 +419,8 @@ class GateController:
             self.ledger.release(request_id)
         if not self.api_error_hook_registered:
             session_id = payload.get("session_id") or ""
-            self.breaker.hit(target, in_flight, [session_id], status,
-                             self.now())
+            _state, _deduped = self.breaker.hit(
+                target, in_flight, [session_id], status, self.now())
 
     # -- breaker hooks (Task 7: the reactive half) ---------------------------
     def install_breaker_hooks(self, driver: "CompactionDriver") -> None:
@@ -436,8 +492,10 @@ class GateController:
             # data point — no L change, no recovery. The entry above is
             # already released.
             return
-        new_state = self.breaker.hit(target, in_flight, [session_id],
-                                     status, self.now())
+        new_state, deduped = self.breaker.hit(
+            target, in_flight, [session_id], status, self.now())
+        line = (f"{status} on '{target}' (in-flight {in_flight:,} tok) "
+                f"-> {new_state}")
         if new_state == "throttle":
             logger.warning(
                 "oom-breaker: 5xx %s on target %s inside the escalate "
@@ -447,6 +505,32 @@ class GateController:
             queue = self.breaker.pending_queue()
             if queue:
                 self._dispatch_compaction(queue[0])
+                line += f", compacting {queue[0]}"
+        if not deduped:
+            # A burst (deduped 5xx) is one post: only the hit that actually
+            # moved the state posts.
+            self._debug_post("5xx", line, home=_current_home(),
+                             label=self._attribution())
+
+    def _pop_dispatch_meta(self, session_id: str) -> Tuple[Optional[str], str]:
+        """The stashed (home, label) for a driver-dispatched compaction, or
+        the post-time fallback (home re-resolved, label re-attributed) when
+        the compression completed outside the driver's dispatch. Pop = the
+        first completer owns the post; a second signal finds nothing."""
+        with self._meta_lock:
+            home, label = self._dispatch_meta.pop(session_id, (None, None))
+        if home is None:
+            home = _current_home()
+        if label is None:
+            label = self._attribution()
+        return home, label
+
+    def _discard_dispatch_meta(self, session_id: str) -> None:
+        """Drop a session's stashed (home, label) without posting: its
+        compaction completed terminally without a committed compress
+        (nothing_to_do / unserviceable), so the entry is stale."""
+        with self._meta_lock:
+            self._dispatch_meta.pop(session_id, None)
 
     # -- compaction dispatch (1-at-a-time) -----------------------------------
     def _dispatch_compaction(self, session_id: str) -> None:
@@ -464,7 +548,10 @@ class GateController:
             logger.warning("oom-breaker: recovery but no compaction driver "
                            "installed; session %r stays queued", session_id)
             return
-        if not driver.compact(session_id, home=_current_home()):
+        home = _current_home()
+        with self._meta_lock:
+            self._dispatch_meta[session_id] = (home, self._attribution())
+        if not driver.compact(session_id, home=home):
             logger.warning("oom-breaker: compaction queue full; session %r "
                            "stays queued until the next completion signal",
                            session_id)
@@ -499,6 +586,12 @@ class GateController:
         # completion for the session it is compacting (a segment's new id
         # differs from it). When sid == active the two forms coincide.
         remaining = self.breaker.compaction_done(active, "compressed")
+        # Post like the driver's signal: meta was stashed under the ACTIVE
+        # id at dispatch; a compress done outside the driver (no meta — e.g.
+        # after a restart) falls back to post-time resolution.
+        home, label = self._pop_dispatch_meta(active)
+        self._debug_post("compacted", self._compaction_line(active, remaining),
+                         home=home, label=label)
         if remaining and self.breaker.state() == "recovery":
             self._dispatch_compaction(remaining[0])
 
@@ -515,13 +608,28 @@ class GateController:
     def _compaction_finished(self, session_id: str, status: str) -> None:
         self.last_driver_status = status
         if status in ("compressed", "nothing_to_do"):
+            # Only the completer that actually completes it posts: a late
+            # duplicate signal finds the session already done and stays
+            # silent (pop semantics, with the fallback for undriven ones).
+            completing = self.breaker.active_session() == session_id
             remaining = self.breaker.compaction_done(session_id, status)
             logger.info("oom-breaker: compaction of %r -> %r; queue now %r",
                         session_id, status, remaining)
+            if completing:
+                if status == "compressed":
+                    # "nothing_to_do" is a no-op: it never posts, but the
+                    # session is done — discard the stashed meta either way.
+                    home, label = self._pop_dispatch_meta(session_id)
+                    self._debug_post("compacted",
+                                     self._compaction_line(session_id, remaining),
+                                     home=home, label=label)
+                else:
+                    self._discard_dispatch_meta(session_id)
             if remaining and self.breaker.state() == "recovery":
                 self._dispatch_compaction(remaining[0])
         elif status == "unserviceable":
             self.breaker.compaction_done(session_id, "unserviceable")
+            self._discard_dispatch_meta(session_id)
             logger.warning(
                 "oom-breaker: compaction of %r refused (unserviceable: the "
                 "session context exceeds the model's limit): THROTTLE + "
@@ -534,6 +642,13 @@ class GateController:
                 "oom-breaker: compaction of %r ended %r; staying in RECOVERY "
                 "(the escalation window bounds it; oom_status surfaces it)",
                 session_id, status)
+
+    def _compaction_line(self, session_id: str, remaining: List[str]) -> str:
+        """The one-line completion notice shared by both completion signals."""
+        if remaining:
+            return f"session {session_id} compacted; queue now " \
+                   f"{len(remaining)} pending"
+        return f"session {session_id} compacted; queue now empty"
 
     # -- operator surface ------------------------------------------------------
     def oom_status(self) -> dict:

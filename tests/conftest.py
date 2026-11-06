@@ -43,5 +43,5 @@ if _PKG not in sys.modules:
     # Every submodule exists now: __init__ imports the four it needs and the
     # adapter's own (now relative) imports pull the rest in transitively.
     for _sub in ("adapter", "compaction_driver", "config", "state",
-                 "ledger", "learner", "breaker", "metrics"):
+                 "ledger", "learner", "breaker", "metrics", "notify"):
         sys.modules[_sub] = sys.modules["%s.%s" % (_PKG, _sub)]

@@ -1,10 +1,11 @@
 name: hermes-oom-breaker
-version: 0.1.0
+version: 0.2.0
 description: >-
   OOM protection for engine LLM traffic: an exact KV fit-gate (llm_execution
   middleware), a reactive compaction breaker on 5xx (1-at-a-time, escalation,
   throttle), and an on-the-fly learned per-target limit L. Optional User-Agent
-  attribution for router dashboards.
+  attribution for router dashboards. Optional one-line Telegram debug
+  notices (off by default).
 provides_hooks:
   - api_request_error
   - post_compaction

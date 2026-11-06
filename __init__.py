@@ -1,4 +1,4 @@
-"""hermes-oom-breaker — v0.1.0: prevents vLLM KV-cache OOM crashes (5xx)
+"""hermes-oom-breaker — v0.2.0: prevents vLLM KV-cache OOM crashes (5xx)
 under concurrent long-context hermes sessions.
 
 The plugin entry point is ``register(ctx)``: it assembles one

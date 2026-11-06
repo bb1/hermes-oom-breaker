@@ -33,6 +33,35 @@ def test_invalid_values_keep_default_and_warn():
     assert any("race_reserve" in w for w in cfg.warnings)
 
 
+def test_debug_defaults_off():
+    cfg = load_config(lambda k, d=None: d)
+    assert not cfg.debug
+    assert cfg.debug_channel == ""
+    assert cfg.debug_min_interval == 60.0
+
+
+def test_debug_settings_override():
+    def get(k, d=None):
+        return {"debug": True, "debug_channel": "telegram:123:45",
+                "debug_min_interval": 30.0}.get(k, d)
+
+    cfg = load_config(get)
+    assert cfg.debug
+    assert cfg.debug_channel == "telegram:123:45"
+    assert cfg.debug_min_interval == 30.0
+
+
+def test_debug_invalid_values_keep_default_and_warn():
+    cfg = load_config(lambda k, d=None: {"debug": "yes", "debug_channel": 42,
+                                         "debug_min_interval": "x"}.get(k, d))
+    assert not cfg.debug
+    assert cfg.debug_channel == ""
+    assert cfg.debug_min_interval == 60.0
+    assert any("debug:" in w for w in cfg.warnings)
+    assert any("debug_channel:" in w for w in cfg.warnings)
+    assert any("debug_min_interval:" in w for w in cfg.warnings)
+
+
 def test_target_model_field_parses():
     def get(k, d=None):
         return {"targets": {"a": {"max_model_len": 100, "kv_budget": 120,

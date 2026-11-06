@@ -35,6 +35,9 @@ class Config:
     log_only: bool = False
     probe_authoritative: bool = False
     user_agent: bool = False
+    debug: bool = False
+    debug_channel: str = ""
+    debug_min_interval: float = 60.0
     targets: Dict[str, Target] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
 
@@ -51,6 +54,9 @@ _KNOWN_KNOBS: Dict[str, type] = {
     "log_only": bool,
     "probe_authoritative": bool,
     "user_agent": bool,
+    "debug": bool,
+    "debug_channel": str,
+    "debug_min_interval": float,
 }
 
 
@@ -114,6 +120,11 @@ def load_config(get_setting: Callable[[str, Any], Any]) -> Config:
         if type_ is bool:
             if not isinstance(value, bool):
                 warnings.append(f"{key}: expected bool, got {value!r}; using default")
+                continue
+            values[key] = value
+        elif type_ is str:
+            if not isinstance(value, str):
+                warnings.append(f"{key}: expected str, got {value!r}; using default")
                 continue
             values[key] = value
         elif _valid_number(value, type_):

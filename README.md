@@ -31,6 +31,14 @@ a live host inside a pre-dawn maintenance window:
   dead request's ledger entry; only 500–599 additionally count as a breaker
   hit (L learning + recovery). Pinned by unit tests.
 
+**v0.2.0 (2026-11-06).** Adds the opt-in debug notices: one-line Telegram
+posts to the scope's home channel at the three moments that matter — a
+registered 5xx hit on a tracked target (`5xx`), a committed session
+compaction (`compacted`), and a request finally admitted after a long hold
+(`delayed`: the `max_hold` deadlock guard or the `hold_escape` idle timeout).
+Off by default; the direct-Bot-API transport (the fleet's "h3" pattern)
+delivers them even while the LLM brain is down. See [Debug posts](#debug-posts).
+
 Known limitations (v0.1.0):
 
 - admission is **per scope**: the host-verified topology is one gateway
@@ -164,7 +172,59 @@ brackets; see [DESIGN.md](specs/DESIGN.md) for the full design):
 | `log_only` | false | gate logs would-be-holds without enforcing (rollout soak mode) |
 | `probe_authoritative` | false | trust the metrics probe over 5xx learning when available |
 | `user_agent` | false | stamp outgoing brain requests with `User-Agent: Hermes/<profile>[:<cron job>]` for dashboard attribution |
+| `debug` | false | master switch for the one-line debug posts (off = total no-op) |
+| `debug_channel` | `""` | post destination: empty → the scope's own home channel (its home `.env`'s `TELEGRAM_HOME_CHANNEL`); else an explicit `telegram:<chat_id>[:<thread_id>]` |
+| `debug_min_interval` | 60.0 s | per-event-type rate limit in seconds (a 5xx burst → one post per interval) |
 
 Operator tools (registered with the agent): `oom_status` (state, per-target L
 and in-flight, last hit, throttle deadline, compaction position) and
 `oom_reset <target>` (restore a target's learned L to its seed).
+
+### Debug posts
+
+One-line Telegram posts for operator visibility, off by default. With
+`debug: true`, one post per event type fires at:
+
+- **`5xx`** — a registered 5xx hit on a tracked target. A burst is one post:
+  the breaker's `hit_dedupe` window collapses it into one hit, and the
+  per-event rate limit bounds everything after;
+- **`compacted`** — a session compaction committed (the driver's completion
+  signal, or the `post_compaction` fallback);
+- **`delayed`** — a request finally admitted after a long hold: the
+  `max_hold` deadlock guard, or the `hold_escape` idle timeout.
+
+Message shape: `[oom-breaker] (label) <one line>` — the label is the
+User-Agent attribution convention: the profile name, `profile:cron-job` when
+the turn is a cron run — omitted when no profile resolves (a cron job alone
+yields no label):
+
+```
+[oom-breaker] (infra:nightly-render) 503 on 'brain' (in-flight 172,340 tok) -> recovery, compacting s123
+[oom-breaker] (infra) session s123 compacted; queue now empty
+[oom-breaker] (infra) request held 612s on 'brain' (max_hold); admitted anyway
+```
+
+**Delivery** — the fleet's "h3" pattern: the plugin calls the Telegram Bot
+API directly (stdlib `urllib`) with `TELEGRAM_BOT_TOKEN` +
+`TELEGRAM_HOME_CHANNEL` from the scope's own home `.env` — no gateway, no
+hermes runtime, so the posts still land while the LLM brain is down. The
+token is never logged. A set `debug_channel` pins a specific chat/thread
+instead (the token still comes from the `.env`); an invalid one warns and
+drops the post.
+
+**Rate limit** — one bucket per event type: at most one post per
+`debug_min_interval` seconds (a bucket's first post is never rate-limited),
+so a 5xx burst is one post per interval.
+
+**Failure mode** — a post is a single attempt; every failure (no home,
+missing token or channel, network, Bot API error) is a loud gateway-log
+warning and a dropped post — never a raised error. The send runs on a daemon
+thread (fire-and-forget) and the synchronous half of a post is a lock plus a
+thread spawn, so no hook path ever blocks and the request path is never
+broken.
+
+**Enabling** — set `debug: true` in the scope's settings; no
+`debug_channel` is needed when the scope's `.env` already carries
+`TELEGRAM_BOT_TOKEN` / `TELEGRAM_HOME_CHANNEL`. Set `debug_channel` to pin a
+specific chat/thread for scopes whose home channel shouldn't receive the
+noise. As with every knob, invalid values warn and keep the default.

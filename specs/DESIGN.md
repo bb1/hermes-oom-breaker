@@ -16,6 +16,9 @@ description: "Full design for the hermes-side plugin that prevents vLLM EngineCo
 > integration finding: the engine's `/metrics` endpoint is auth-protected
 > (401), so probe-based budget seeding is unavailable there and L-learning
 > runs from 5xx data points only (the designed fallback).
+>
+> **Status (2026-11-06):** v0.2.0 adds Layer 4 (the opt-in debug notices,
+> off by default) — implemented, unit-green (158 tests).
 
 ## Problem
 
@@ -198,6 +201,51 @@ No calibration window. L converges from real operation; every 5xx is a data poin
   point, exact from then on. Day-1 (L₀) already prevents the two-big-sessions
   scenario deterministically.
 
+### Layer 4 — debug notices (off by default)
+The operator-visibility problem: the plugin's decisions — a registered 5xx
+hit, a compaction commit, a request admitted after a long hold — land in
+gateway logs that are read after the fact, not while the host is burning. A
+one-line post at each of those three moments is cheap operator value, and it
+must reach the operator *while the LLM brain is down* (the moment when the
+agent itself, the other channel, can't). That decides the transport: the
+fleet's **h3 pattern** — direct Telegram Bot API over stdlib `urllib`,
+credentials from the scope's own home `.env` (`TELEGRAM_BOT_TOKEN` +
+`TELEGRAM_HOME_CHANNEL`), no gateway, no hermes runtime. The notice path must
+never depend on the thing under repair.
+
+Three event sites, one post each, one rate bucket per event type:
+
+| event | when |
+|---|---|
+| `5xx` | a *registered* 5xx on a tracked target — a burst dedupes to one post (the breaker's `hit_dedupe` window; a deduped hit posts nothing), then the per-event rate limit bounds the rest |
+| `compacted` | a session compaction committed — the driver's `compressed` signal (primary), or the `post_compaction` fallback |
+| `delayed` | a request finally admitted after a long hold — the `max_hold` deadlock guard, or the `hold_escape` idle timeout |
+
+- **Message shape** — `[oom-breaker] (label) <one line>`; the label reuses the
+  User-Agent attribution convention (Layer 1b) minus the `Hermes` prefix, but
+  stricter: the profile name, `profile:cron-job` for a cron turn — omitted
+  when no profile resolves (a cron job alone yields no label, unlike the UA's
+  `Hermes:<job>`). The notifier stays dumb (it sends the composed text as-is);
+  the event site owns the line.
+- **Home-channel resolution** — per scope, from the scope's own home `.env`
+  (the module is imported per scope, so "the home" is that scope's home). An
+  explicit `debug_channel` (`telegram:<chat_id>[:<thread_id>]`) overrides
+  the destination only — the token still comes from the `.env`. That is the
+  answer for scopes whose home channel shouldn't receive the noise.
+- **Rate limit** — `debug_min_interval` seconds per event type (default 60):
+  a 5xx burst is one post per interval. The stamp is taken at acceptance; a
+  bucket's first post is never rate-limited.
+- **Never-raise contract** — the synchronous half of a post is a lock plus a
+  daemon-thread spawn only (no I/O on the caller's thread — hook paths never
+  block); the send is a single attempt (20 s timeout), and every failure path
+  — no home, unreadable `.env`, missing token or channel, invalid
+  `debug_channel`, network, Bot API `ok:false` — is a loud log warning and a
+  dropped post. The same ruling as the gate's fail-open (Layer 1) and the
+  attribution's observability-only (Layer 1b): this path must never break a
+  request. The token is never logged.
+- Off by default, and a total no-op while `debug` is off (the notifier
+  returns before touching any seam).
+
 ## Hermes extension points (verified — official docs + checkout)
 The contract was verified against the official site:
 `/docs/developer-guide/plugins` (authoring), `/observer-hooks` (telemetry
@@ -276,6 +324,9 @@ patches; the plugin is a single general plugin, enabled per profile.
 | ~~`reprobe`~~ | *removed in v0.1.0* | was a silent no-op (never consumed); hold-escape admission is the only automatic upward path for L (manual `oom_reset` is the other) |
 | `log_only` | off (rollout soak) | gate logs would-be-holds without enforcing |
 | `user_agent` | off (on in rollout) | stamp outgoing requests with `User-Agent: Hermes/<profile>[:<cron job>]` for dashboard attribution |
+| `debug` | off | master switch for the one-line debug notices (Layer 4); a total no-op when off |
+| `debug_channel` | `""` (empty) | empty → the scope's own home channel (its home `.env`'s `TELEGRAM_HOME_CHANNEL`); else an explicit `telegram:<chat_id>[:<thread_id>]` (the token still comes from the `.env`) |
+| `debug_min_interval` | 60 s | per-event-type rate limit (a 5xx burst → one post per interval) |
 
 ## Build-time verification (all 8 resolved on-host during the build)
 1. **Per-attempt re-entry** — ✅ resolved: hermes' retry loop re-invokes the

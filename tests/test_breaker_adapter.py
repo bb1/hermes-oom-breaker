@@ -11,6 +11,7 @@ The driver is the ``FakeDriver`` double (no threads): tests control when a
 compaction finishes via ``driver.finish``. Payload dicts use hermes'
 verified hook field names (Task 7 brief, section A).
 """
+import pytest
 import time
 from types import SimpleNamespace
 
@@ -164,7 +165,8 @@ def test_oom_reset():
 def test_oom_reset_unknown_target():
     NOW[0] = 100.0
     g, driver = make()
-    assert g.oom_reset("nope") == {"error": "unknown target"}
+    with pytest.raises(ValueError):
+        g.oom_reset("nope")
 
 
 def test_streaming_error_releases_ledger_entry():

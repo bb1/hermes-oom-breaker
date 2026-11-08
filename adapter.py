@@ -675,13 +675,15 @@ class GateController:
 
     def oom_reset(self, target: str) -> dict:
         """Operator/tool surface: restore a target's learned L to its seed
-        (clears the escalation window). Unknown target -> error dict."""
+        (clears the escalation window). Unknown target -> raises ValueError
+        (the original exception stays visible via the exc_info warning
+        log)."""
         try:
             new_l = self.learner.reset(target)
         except Exception:
             logger.warning("oom-breaker oom_reset: unknown target %r",
                            target, exc_info=True)
-            return {"error": "unknown target"}
+            raise ValueError(f"unknown target: {target!r}") from None
         logger.info("oom-breaker oom_reset: target %r L back to %d",
                     target, new_l)
         return {"reset": target, "l": new_l}

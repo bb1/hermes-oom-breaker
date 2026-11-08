@@ -1,4 +1,4 @@
-"""hermes-oom-breaker — v0.2.0: prevents vLLM KV-cache OOM crashes (5xx)
+"""hermes-oom-breaker — v0.2.1: prevents vLLM KV-cache OOM crashes (5xx)
 under concurrent long-context hermes sessions.
 
 The plugin entry point is ``register(ctx)``: it assembles one
@@ -29,8 +29,8 @@ whose ``__path__`` is the plugin directory).
 """
 from __future__ import annotations
 
+import json
 import logging
-import os
 
 # Relative sibling imports: hermes loads a directory plugin as a PACKAGE
 # (hermes_plugins.<slug> with __path__ = the plugin dir — see
@@ -87,16 +87,6 @@ def register(ctx) -> None:
         logger.warning("oom-breaker config: %s", w)
     store = Store(_StateShim(ctx.state))
 
-    # Cross-process check (Review Focus #3): the store may belong to another
-    # gateway process. Loud warning, degrade, continue — never crash.
-    pid = os.getpid()
-    recorded = store.get("pid")
-    if recorded is not None and recorded != pid:
-        logger.warning(
-            "oom-breaker: possible stale state: the store records pid %s but "
-            "this process is pid %s (a different process may own it); "
-            "continuing in degraded mode", recorded, pid)
-
     # -- controller + targets (D3' lazy seed: a learned L survives) --------
     controller = GateController(cfg, store)
     controller.load_targets()
@@ -104,7 +94,6 @@ def register(ctx) -> None:
         logger.warning(
             "oom-breaker: unconfigured: no targets in settings; the gate is "
             "a pass-through (zero behavior change)")
-    store.set("pid", pid)      # (re)claim the store for this process
 
     # -- driver + breaker hooks --------------------------------------------
     driver = _driver_cls()
@@ -130,13 +119,16 @@ def register(ctx) -> None:
     ctx.register_hook("post_api_request", controller.post_api_request)
     ctx.register_tool("oom_status", "oom_breaker", {}, _oom_status_tool,
                       description="OOM-breaker status: per-target L, "
-                                  "in-flight, breaker state")
+                                  "in-flight, breaker state; the result "
+                                  "is a JSON document string")
     ctx.register_tool("oom_reset", "oom_breaker",
                       {"type": "object",
                        "properties": {"target": {"type": "string"}},
                        "required": ["target"]},
                       _oom_reset_tool,
-                      description="Reset a target's learned limit L to its seed")
+                      description="Reset a target's learned limit L to its "
+                                  "seed; the result is a JSON document "
+                                  "string")
     ctx.on_unload(_on_unload)
 
     # -- metrics probe: only for targets that have a metrics_url ------------
@@ -147,13 +139,18 @@ def register(ctx) -> None:
 
 
 def _oom_status_tool(args):
-    """``oom_status`` tool handler: the operator status dict."""
-    return _controller.oom_status()
+    """``oom_status`` tool handler: the operator status as a JSON document
+    string (hermes' tool registry accepts str only)."""
+    return json.dumps(_controller.oom_status(), indent=2)
 
 
 def _oom_reset_tool(args):
-    """``oom_reset`` tool handler: reset a target's learned L to its seed."""
-    return _controller.oom_reset(args.get("target"))
+    """``oom_reset`` tool handler: reset a target's learned L to its seed;
+    the result is a JSON document string (hermes' tool registry accepts
+    str only). An unknown target raises ValueError — hermes' dispatch
+    converts handler exceptions into the standard error envelope, so the
+    wrapper never has two result shapes."""
+    return json.dumps(_controller.oom_reset(args.get("target")), indent=2)
 
 
 def _on_unload() -> None:

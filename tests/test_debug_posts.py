@@ -16,8 +16,9 @@ shared DictSink double (the one cross-test import, as test_breaker_adapter.py
 does) and a recording FakeNotifier injected through the controller's
 notifier= parameter.
 """
+import sys
 import pytest
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
 
 import adapter
 from adapter import GateController
@@ -82,8 +83,16 @@ def fire(g, status=500, session_id="s1", **extra):
 
 # -- Site A: the canonical 5xx -----------------------------------------------
 
-def test_5xx_posts_once_with_event_state_and_target():
+def test_5xx_posts_once_with_event_state_and_target(monkeypatch):
     NOW[0] = 100.0
+    # Interpreter-independent: stub the lazy hermes import for the duration
+    # of the test. The stub simulates an importable hermes: in a hermes-free
+    # env the stub IS the import; in a hermes-importable env it overrides
+    # the real module for this test (monkeypatch restores sys.modules on
+    # teardown — no leakage to any other test).
+    fake = ModuleType("hermes_constants")
+    fake.get_hermes_home = lambda: "/fake/hermes/home"
+    monkeypatch.setitem(sys.modules, "hermes_constants", fake)
     g, driver = make()
     fire(g)
     assert len(g._notifier.posts) == 1
@@ -93,7 +102,8 @@ def test_5xx_posts_once_with_event_state_and_target():
     assert "500" in text
     assert "'brain'" in text
     assert "-> recovery" in text
-    assert home is None      # _current_home() is None in a hermes-free test
+    assert home == "/fake/hermes/home"    # interpreter-independent: the post
+                                          # carries the home hermes reports
 
 
 @pytest.mark.parametrize("profile,job,want_prefix", [

@@ -22,8 +22,10 @@ import ast
 import importlib
 import importlib.util
 import itertools
+import json
 import logging
 import os
+import pytest
 import sys
 import types
 
@@ -172,14 +174,13 @@ def test_registers_exact_surface_set(caplog):
                                             "properties": {"target": {"type": "string"}},
                                             "required": ["target"]}
     assert "OOM-breaker status" in tools["oom_status"]["description"]
+    assert "JSON" in tools["oom_status"]["description"]
     assert "Reset a target's learned limit L" in tools["oom_reset"]["description"]
+    assert "JSON" in tools["oom_reset"]["description"]
 
     # Breaker hooks installed: canonical-hook flag set, driver wired.
     assert ctrl.api_error_hook_registered is True
     assert ctrl.compaction_driver is not None
-
-    # The current pid was recorded in the store (cross-process check).
-    assert ctx.state.d["oom_breaker.state"]["pid"] == os.getpid()
 
     # hermes-free env: the estimator stays the project default, and the
     # failed swap is logged loudly (no silent fallback).
@@ -187,11 +188,19 @@ def test_registers_exact_surface_set(caplog):
     assert any("estimate_request_context_tokens" in r.message
                for r in caplog.records if r.levelno == logging.WARNING)
 
-    # The tool handlers reach the controller (and fail safe on bad input).
-    status = tools["oom_status"]["handler"]({})
+    # The tool handlers reach the controller and return JSON document
+    # strings (hermes' tool registry accepts str only — the wrappers
+    # serialize the controller's dict shape); a bad target RAISES
+    # ValueError, which hermes' dispatch converts into the standard
+    # error envelope.
+    status_doc = tools["oom_status"]["handler"]({})
+    assert isinstance(status_doc, str)
+    status = json.loads(status_doc)
+    assert set(status) == {"state", "L", "in_flight", "last_hit",
+                           "throttle_until", "unserviceable", "compaction"}
     assert status["state"] == "normal" and status["L"] == {}
-    assert tools["oom_reset"]["handler"]({"target": "nope"}) == \
-        {"error": "unknown target"}
+    with pytest.raises(ValueError):
+        tools["oom_reset"]["handler"]({"target": "nope"})
 
 
 def test_second_register_is_idempotent(caplog):
@@ -212,21 +221,24 @@ def test_second_register_is_idempotent(caplog):
             list(ctx.unloads), dict(ctx.state.d)) == snap
 
 
-def test_cross_process_pid_mismatch_warns_but_registers(caplog):
-    """Binding 3: a different recorded pid logs the loud cross-process
-    warning but registration still completes, and the store is re-claimed."""
+def test_stale_pid_field_in_store_is_inert(caplog):
+    """Binding 3 (updated v0.2.1): a store blob carrying a foreign/legacy
+    ``pid`` field registers cleanly with no stale-state warning; the field
+    is inert metadata (not consumed, not rewritten, not deleted)."""
     mod = fresh_module()
     ctx = FakeCtx()
     ctx.state.set("oom_breaker.state", {"pid": 999_999_999})
     with caplog.at_level(logging.WARNING, logger="oom_breaker"):
         register_with(mod, ctx)
-    assert any("999999999" in r.message
-               for r in caplog.records if r.levelno == logging.WARNING)
-    # Still fully registered (degrade, don't crash).
+    # Registration completed fully.
     assert len(ctx.middlewares) == 2 and len(ctx.hooks) == 3
     assert len(ctx.tools) == 2 and len(ctx.unloads) == 1
-    # The store is now owned by this process.
-    assert ctx.state.d["oom_breaker.state"]["pid"] == os.getpid()
+    # No "stale state" warning — and no "degraded" claim either.
+    assert not any("stale state" in r.message or "degraded" in r.message
+                   for r in caplog.records
+                   if r.levelno == logging.WARNING)
+    # The legacy field is inert: untouched by the register.
+    assert ctx.state.d["oom_breaker.state"]["pid"] == 999_999_999
 
 
 def test_load_targets_preserves_lowered_learned_l():

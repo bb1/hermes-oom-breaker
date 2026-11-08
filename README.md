@@ -39,6 +39,24 @@ compaction (`compacted`), and a request finally admitted after a long hold
 Off by default; the direct-Bot-API transport (the fleet's "h3" pattern)
 delivers them even while the LLM brain is down. See [Debug posts](#debug-posts).
 
+**v0.2.1 (2026-11-08).** Fixes the operator tool contract and two chronic P2
+defects found in live operation:
+
+- `oom_status` / `oom_reset` now return a JSON document string — hermes' tool
+  registry only accepts `str` (or the multimodal envelope), and the dict they
+  returned was hard-rejected at dispatch (`error_type=tool_result_contract`),
+  leaving the operator surface dark;
+- `oom_reset` on an unknown target raises `ValueError` — hermes' dispatch
+  converts it to the standard error envelope, so no ad-hoc error dict crosses
+  the plugin boundary;
+- removed the per-process `pid` bookkeeping and the "possible stale state …
+  continuing in degraded mode" warning: no degraded code path ever existed, and
+  on multi-process hosts the pid mismatch is the normal state (the warning
+  fired on essentially every process start);
+- the test suite is now interpreter-independent: the 5xx debug-post test stubs
+  `hermes_constants` instead of relying on its import failing, so the suite is
+  green in both hermes-free and hermes-importable interpreters.
+
 Known limitations (v0.1.0):
 
 - admission is **per scope**: the host-verified topology is one gateway
@@ -178,7 +196,8 @@ brackets; see [DESIGN.md](specs/DESIGN.md) for the full design):
 
 Operator tools (registered with the agent): `oom_status` (state, per-target L
 and in-flight, last hit, throttle deadline, compaction position) and
-`oom_reset <target>` (restore a target's learned L to its seed).
+`oom_reset <target>` (restore a target's learned L to its seed). Both return a
+JSON document string (hermes' tool registry accepts only str).
 
 ### Debug posts
 

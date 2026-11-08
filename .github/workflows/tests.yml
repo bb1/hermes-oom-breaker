@@ -22,12 +22,13 @@ jobs:
           python-version: "3.11"
       - name: Install pytest
         run: python -m pip install pytest==9.2.0
-      # pytest must run from a different CWD than the repo root: from the
-      # root, pytest-9 imports the plugin's top-level __init__.py as a test
-      # module and collection fails (documented harness quirk, not a plugin
-      # bug).
+      # pytest (9.x) with no ini file in the tests dir's ancestor chain resolves rootdir from the CWD whenever the
+      # CWD and the tests argument share a path prefix — always the case on the runner, where $RUNNER_TEMP and
+      # $GITHUB_WORKSPACE both live under /home/runner/work; with rootdir set to the CWD, pytest imports the
+      # plugin's top-level __init__.py as a test module and all 158 test collections error (ImportError: attempted
+      # relative import with no known parent package); the explicit --rootdir pins rootdir to the tests directory, making the run CWD-independent (the cd to $RUNNER_TEMP is kept only to keep pytest artifacts out of the workspace).
       - name: Run suite (hermes-free)
-        run: cd "$RUNNER_TEMP" && pytest "$GITHUB_WORKSPACE/tests" -q
+        run: cd "$RUNNER_TEMP" && pytest --rootdir="$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/tests" -q
 
   suite-hermes-importable:
     runs-on: ubuntu-latest
@@ -51,4 +52,4 @@ jobs:
               return Path("$RUNNER_TEMP/fake-hermes/home")
           EOF
       - name: Run suite (hermes-importable)
-        run: cd "$RUNNER_TEMP" && PYTHONPATH="$RUNNER_TEMP/fake-hermes" pytest "$GITHUB_WORKSPACE/tests" -q
+        run: cd "$RUNNER_TEMP" && PYTHONPATH="$RUNNER_TEMP/fake-hermes" pytest --rootdir="$GITHUB_WORKSPACE/tests" "$GITHUB_WORKSPACE/tests" -q

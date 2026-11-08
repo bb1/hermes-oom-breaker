@@ -1,0 +1,54 @@
+# Test suite: 158 tests, hermes-free by contract (the plugin's top-level
+# modules import no hermes-internal package; every hermes import is lazy,
+# inside a function body).
+#
+# Two jobs because the suite must be green in both a hermes-free interpreter
+# and a hermes-importable interpreter — the latter simulated with a fake
+# hermes_constants module on PYTHONPATH, as the hermes runtime provides it.
+name: tests
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  suite-hermes-free:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: python -m pip install pytest==9.2.0
+      # pytest must run from a different CWD than the repo root: from the
+      # root, pytest-9 imports the plugin's top-level __init__.py as a test
+      # module and collection fails (documented harness quirk, not a plugin
+      # bug).
+      - name: Run suite (hermes-free)
+        run: cd "$RUNNER_TEMP" && pytest "$GITHUB_WORKSPACE/tests" -q
+
+  suite-hermes-importable:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install pytest
+        run: python -m pip install pytest==9.2.0
+      - name: Simulate a hermes-importable interpreter
+        run: |
+          # home/ exists and intentionally has NO .env file — mirror of the
+          # verified local setup.
+          mkdir -p "$RUNNER_TEMP/fake-hermes/home"
+          cat > "$RUNNER_TEMP/fake-hermes/hermes_constants.py" <<EOF
+          """Test stand-in for hermes' hermes_constants (simulates a hermes-importable interpreter)."""
+          from pathlib import Path
+
+          def get_hermes_home():
+              return Path("$RUNNER_TEMP/fake-hermes/home")
+          EOF
+      - name: Run suite (hermes-importable)
+        run: cd "$RUNNER_TEMP" && PYTHONPATH="$RUNNER_TEMP/fake-hermes" pytest "$GITHUB_WORKSPACE/tests" -q

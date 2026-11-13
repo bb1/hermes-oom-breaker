@@ -81,16 +81,15 @@ def test_two_keyed_targets_same_router_url():
     assert lg.in_flight_total() == 0
 
 
-def test_hold_escape_when_idle():
-    # Deadlock guard: L was tightened below a solo request's need (e.g. after
-    # a 5xx lowered L). Engine is idle, request still doesn't fit -> after
-    # hold_escape it fires anyway (solo-long sessions can never deadlock).
+def test_solo_over_limit_admits_on_idle():
+    # Load-gate deadlock guard: L was tightened below a solo request's need
+    # (e.g. after a 5xx lowered L). The engine is idle (no other request in
+    # flight), so the request is released immediately — it no longer waits out
+    # the 300s escape, so a solo-long session can never deadlock.
     t, lg, targets = make_ledger(L=500)
     ok, why = lg.held("r1", "s1", "brain", 900, 500)
-    assert not ok and why == "hold"
-    t[0] += 301                # engine idle the whole time, > hold_escape
-    ok, why = lg.held("r1", "s1", "brain", 900, 500)
     assert ok and why == "hold_escape"
+    assert lg.in_flight("brain") == 900
 
 
 def test_hold_escape_requires_idle_engine():

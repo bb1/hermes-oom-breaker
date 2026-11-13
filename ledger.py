@@ -116,7 +116,13 @@ class Ledger:
     # -- transitions ---------------------------------------------------
     def admit(self, request_id: str, session_id: str, target: str, needed: int,
               L: int, throttle: bool, engine_idle_since: Optional[float] = None) -> tuple:
-        """Admit iff it fits (and THROTTLE ⇒ nothing else in flight).
+        """Admit iff it fits — or immediately when the engine is idle.
+
+        Load-gate (v0.2.1): a hold engages ONLY when there is another request
+        in flight. When the engine is idle (total in-flight 0) there is no
+        concurrent KV pressure, so the request is admitted regardless of the
+        (possibly depressed) learned limit L. THROTTLE still forces serial
+        admission (nothing is admitted while another request is in flight).
 
         Returns ``(admitted, reason)`` with reason in
         ``"admit" | "hold" | "throttle" | "already-tracked"``.
@@ -128,6 +134,10 @@ class Ledger:
                 return (True, "already-tracked")
             if throttle and self.in_flight_total() > 0:
                 return (False, "throttle")
+            if self.in_flight_total() == 0:
+                # Engine idle: no concurrent OOM risk → admit regardless of L.
+                self._add(request_id, session_id, target, needed)
+                return (True, "admit")
             if self.in_flight(target) + needed > L:
                 return (False, "hold")
             self._add(request_id, session_id, target, needed)
@@ -135,16 +145,22 @@ class Ledger:
 
     def held(self, request_id: str, session_id: str, target: str, needed: int,
              L: int, throttle: bool = False) -> tuple:
-        """Re-check a held request; admits when it fits or on hold-escape.
+        """Re-check a held request; releases when the engine is idle, when it
+        fits, or on the 300s hold-escape.
+
+        Load-gate (v0.2.1): the moment the engine goes idle (no other request
+        in flight) the held request is released immediately — it no longer
+        waits out the 300s escape. That release is reported as
+        ``"hold_escape"`` so the adapter's ``on_hold_escape_admit`` L-raise
+        still fires (the learned limit recovers exactly as before). The 300s
+        idle-escape is kept below as the defensive L-raise backstop.
 
         THROTTLE (mirroring ``admit``) holds regardless of fit: serial
         admission is THROTTLE's safety property — a held request must not be
         admitted while another request is in flight, even when it fits.
 
-        Hold-escape: the engine has been *idle* (total in-flight 0) for at
-        least ``hold_escape`` seconds while this request waits. Returns
-        ``(admitted, reason)`` with reason ``"admit" | "hold" | "throttle" |
-        "hold_escape" | "already-tracked"``.
+        Returns ``(admitted, reason)`` with reason ``"admit" | "hold" |
+        "throttle" | "hold_escape" | "already-tracked"``.
         """
         with self._lock:
             if request_id in self._entries:
@@ -155,12 +171,26 @@ class Ledger:
                 # THROTTLE window.
                 self._held_since.setdefault(request_id, self._now())
                 return (False, "throttle")
+            # Fit first: a held request that now fits the learned limit is a
+            # normal "admit" (preserves the fit→"admit" distinction the
+            # throttle test relies on).
             if self.in_flight(target) + needed <= L:
                 self._add(request_id, session_id, target, needed)
                 self._held_since.pop(request_id, None)
                 return (True, "admit")
+            # Load-gate: the engine is idle (no other request in flight), so
+            # release now — no 300s wait. A solo request that no longer fits
+            # the (possibly depressed) learned limit cannot deadlock. Reported
+            # as "hold_escape" so the L-raise backstop still fires.
+            if self.in_flight_total() == 0:
+                self._add(request_id, session_id, target, needed)
+                self._held_since.pop(request_id, None)
+                return (True, "hold_escape")
             idle = self.idle_since()
             if idle is not None and self._now() - idle >= self._hold_escape:
+                # Defensive backstop: in_flight_total()==0 already released
+                # above, so this 300s path is only reached if that check is
+                # ever bypassed; kept so the L-raise recovery never regresses.
                 self._add(request_id, session_id, target, needed)
                 self._held_since.pop(request_id, None)
                 return (True, "hold_escape")

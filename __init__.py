@@ -1,12 +1,15 @@
-"""hermes-oom-breaker — v0.2.1: prevents vLLM KV-cache OOM crashes (5xx)
-under concurrent long-context hermes sessions.
+"""hermes-oom-breaker — v0.2.2: load-gated KV fit-gate (hold only when a
+request is in flight) + reactive compaction breaker, preventing vLLM KV-cache
+OOM crashes (5xx) under concurrent long-context hermes sessions.
 
 The plugin entry point is ``register(ctx)``: it assembles one
 ``GateController`` per gateway process (module singleton, idempotent) and
 wires hermes' documented surfaces —
 
 - ``ctx.register_middleware("llm_execution", ...)`` — the exact KV fit-gate
-  (admits requests that fit the learned limit L, holds the ones that do not)
+  (admits a request that fits the learned limit L, or immediately when the
+  engine is idle; holds only when another request is in flight and it is
+  over the limit)
 - ``ctx.register_middleware("llm_request", ...)`` — optional User-Agent
   attribution for router dashboards (runtime no-op while ``user_agent`` off)
 - ``ctx.register_hook("api_request_error", ...)`` — the canonical 5xx hit

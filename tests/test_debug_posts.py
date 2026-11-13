@@ -230,6 +230,10 @@ def test_max_hold_escape_admission_posts_delayed():
     NOW[0] = 100.0
     cfg = Config(hold_escape=10_000.0)       # hold_escape must not preempt
     g, driver = make(cfg=cfg)                # sleep= advances the virtual clock
+    # A competing in-flight request keeps the engine busy, so the big request
+    # is held (the load-gate only admits a solo idle request) and the max_hold
+    # deadlock guard is the escape.
+    g.ledger.admit("rcomp", "scomp", "brain", 250000, 254723, False)
     out = g.llm_execution(
         {"messages": [{"content": "x" * 1_000_000}], "max_tokens": 40_000},
         lambda r: SimpleNamespace(usage=None),
@@ -247,17 +251,21 @@ def test_max_hold_escape_admission_posts_delayed():
 def test_hold_escape_admission_posts_delayed():
     NOW[0] = 100.0
     g, driver = make()                       # default hold_escape=300
-    g.llm_execution(
-        {"messages": [{"content": "x" * 1_000_000}], "max_tokens": 40_000},
-        lambda r: SimpleNamespace(usage=None),
-        **{**CTX, "api_request_id": "rheld"})
+    # Load-gate: a held request is released the moment the engine drains (no
+    # 300s wait). Set up the request held while a competing request is in
+    # flight, then drain the engine and drive the hold-loop directly.
+    needed = 290000                         # big: over the 254723 limit
+    g.ledger.admit("rcomp", "scomp", "brain", 200000, 254723, False)  # engine busy
+    ok, why = g.ledger.admit("rheld", "s1", "brain", needed, 254723, False)
+    assert not ok and why == "hold"          # busy + over budget -> held
+    g.ledger.held("rheld", "s1", "brain", needed, 254723, False)     # mark held_since
+    g.ledger.release("rcomp")                # engine drains -> idle
+    g._hold("brain", "rheld", "s1", needed, 254723)
     assert [p[0] for p in g._notifier.posts] == ["delayed"]
     event, text, home = g._notifier.posts[0]
     assert event == "delayed"
-    assert "held 300s" in text
     assert "(hold_escape)" in text
     assert "admitted" in text
-    assert NOW[0] >= 100.0 + 300.0
 
 
 def test_normal_fit_admission_posts_nothing():

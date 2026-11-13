@@ -243,7 +243,12 @@ class GatewayDriver(CompactionDriver):
             return "error:no-home"
         try:
             from hermes_cli.gateway_runtime import discover_gateway_endpoint
-            info = await asyncio.to_thread(discover_gateway_endpoint, home, 2.0)
+            # ``timeout`` is keyword-only in the current hermes
+            # ``discover_gateway_endpoint(profile_home, *, timeout=2.0)``;
+            # passing it positionally raises TypeError and every compaction
+            # then fails (see the 2026-11-13 family RECOVERY wedge).
+            info = await asyncio.to_thread(discover_gateway_endpoint,
+                                           home, timeout=2.0)
             endpoint = getattr(info, "endpoint", None)
         except Exception as exc:
             return _err(exc)
